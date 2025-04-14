@@ -1,0 +1,208 @@
+import os
+if os.getenv("CUDA_VISIBLE_DEVICES") is None:
+    gpu_num = 0  # Use "" to use the CPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu_num}"
+# Set log level
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import tensorflow as tf
+# Ignore unnecessary warnings
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+    try:
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+    except RuntimeError as e:
+        print(e)
+# Avoid warnings from TensorFlow
+tf.get_logger().setLevel("ERROR")
+import numpy as np
+import sionna
+sionna.config.seed = 42  # Set seed for reproducible results
+from sionna.channel.tr38901 import AntennaArray, CDL, UMi, UMa, RMa, Antenna
+from sionna.mimo import StreamManagement
+from sionna.ofdm import LinearDetector
+from sionna.channel import gen_single_sector_topology as gen_topology, AWGN, GenerateOFDMChannel, ApplyOFDMChannel
+from sionna.nr import PUSCHConfig, PUSCHTransmitter, PUSCHReceiver
+from sionna.utils import compute_ber, ebnodb2no, sim_ber
+import matplotlib.pyplot as plt
+
+# Config  Reference:https://nvlabs.github.io/sionna/examples/5G_NR_PUSCH.html
+NUM_UT = 2  # num_tx
+NUM_BS = 1  # num_rx
+NUM_UT_ANT = 2  # Num_antenna_ports
+NUM_BS_ANT = 4
+num_layers = 2  # Equal num_streams,must be smaller than or equal to num_ant_ports
+mcs_table = 2  # Reference:https://nvlabs.github.io/sionna/api/nr.html#transport-block
+mcs_index = 23  # 15 for 64QAM, 23 for 256QAM
+num_prb = 4  # 1 PRB = 12 carrier resource grid
+
+# choose channel type
+channel_type_ = "CDL"  # Choose umi or CDL
+# CDL config
+cdl_model1 = "A"  # if you use CDL model
+cdl_model2 = "C"
+delay_spread = 300e-9  # s
+speed = 10.0  # Speed for evaluation and training [m/s],36KM/H
+carrier_frequency = 2.14e9  # Hz,This is needed here to define the antenna element spacing.
+subcarrier_spacing = 30e3  # Hz
+
+# SNR range for evaluation [dB]
+ebno_db_min = 5.0
+ebno_db_max = 25.0
+ebno_dbs = np.arange(ebno_db_min, ebno_db_max, 3)
+
+
+# PUSCHConfig for the one transmitter
+pusch_config = PUSCHConfig()
+# Carrier configuration
+pusch_config.carrier.cyclic_prefix = "normal"  # “normal” (default) | “extended”
+pusch_config.carrier.frame_number = 0  # System frame number, 0 (default), [0,…,1023]
+pusch_config.carrier.n_cell_id = 1  # Physical layer cell identity,1 (default) | [0,…,1007]
+pusch_config.carrier.n_size_grid = num_prb  # Number of RB in the carrier resource grid,4 (default) | [1,…,275]
+pusch_config.carrier.n_start_grid = 0  # Start of resource grid relative to CRB,0 (default) | [0,…,2199]
+pusch_config.carrier.slot_number = 0  # Slot number within a frame,int, 0 (default), [0,…,num_slots_per_frame]
+pusch_config.carrier.subcarrier_spacing = subcarrier_spacing / 1000  # 15 | 30 | 60 | 120 | 240 | 480 | 960 kHz
+# DMRS configuration
+pusch_config.dmrs.additional_position = 1  # Maximum number of additional DMRS positions,0 (default) | 1 | 2 | 3
+pusch_config.dmrs.config_type = 1  # The configuration type determines the frequency density of DMRS signals.With configuration type 1, six subcarriers per PRB are used for each antenna port, with configuration type 2, four subcarriers are used.
+pusch_config.dmrs.dmrs_port_set = [0,1]  # use[0,1] if num_layers=2,The pilots signals of DMRS port 0 and 1 (as well as 2 and 3) interfere with each other as they occupy the same resource elements
+pusch_config.dmrs.length = 1  # Number of front-loaded DMRS symbols,1 for single symbol and 2 for double
+pusch_config.dmrs.n_id = [1, 1]  # Defines the scrambling identities
+pusch_config.dmrs.n_scid = 1  # DMRS scrambling initialization
+pusch_config.dmrs.num_cdm_groups_without_data = 2  # Determines which resource elements in a DMRS-carrying OFDM symbol are masked for data transmissions. This is to avoid inference with pilots from other DMRS groups
+pusch_config.dmrs.type_a_position = 2  # Position of first DMRS OFDM symbol,applies if the mapping_type is “A”.
+# other configuration
+pusch_config.mapping_type = "A"  # Mapping type,“A” (default) | “B”
+pusch_config.n_rnti = 1  # Radio network temporary identifier
+pusch_config.num_antenna_ports = NUM_UT_ANT  # Number of antenna ports,Must be larger than or equal to num_layers.
+pusch_config.num_layers = num_layers  # Number of layers,Must be smaller than or equal to num_antenna_port.
+pusch_config.precoding = "codebook"  # transmission scheme,“non-codebook” (default), “codebook”
+pusch_config.tpmi = 1  # Transmit precoding matrix indicator,The allowed value depends on the number of layers and the number of antenna ports according to Table 6.3.1.5-1 until Table 6.3.1.5-7 [3GPP38211].
+# Transport block configuration
+pusch_config.tb.mcs_index = mcs_index  # Modulation and coding scheme (MCS) index
+pusch_config.tb.mcs_table = mcs_table  # Indicates which MCS table from [3GPP38214] to use.
+pusch_config.tb.n_id = 1  # Data scrambling initialization,related to cell id and provided by higher layer
+num_bits_per_symbol = pusch_config.tb.num_bits_per_symbol
+# Create PUSCHConfigs for the other transmitters by cloning of the first PUSCHConfig and modifying the used DMRS ports.
+pusch_configs = [pusch_config]
+for i in range(1, NUM_UT):
+    pc = pusch_config.clone()
+    pc.dmrs.dmrs_port_set = [2, 3]  # use[2,3] if num_layers=2
+    pusch_configs.append(pc)
+
+# pusch_config.carrier.show()
+# pusch_config.dmrs.show()
+# pusch_config.tb.show()
+
+
+def choose_channel(cdl_model="C"):
+    bs_ut_association = np.zeros([NUM_BS, NUM_UT])
+    bs_ut_association[0, :] = 1
+    sm = StreamManagement(bs_ut_association, pusch_config.num_layers)
+
+    ut_array = AntennaArray(
+        num_rows=1,
+        num_cols=int(NUM_UT_ANT / 2),
+        polarization="dual",
+        polarization_type="cross",
+        antenna_pattern="38.901",
+        carrier_frequency=carrier_frequency)
+    # Define the BS antenna array
+    bs_array = AntennaArray(
+        num_rows=1,
+        num_cols=int(NUM_BS_ANT / 2),
+        polarization="dual",
+        polarization_type="cross",
+        antenna_pattern="38.901",
+        carrier_frequency=carrier_frequency)
+
+    channel_cdl = CDL(
+        model=cdl_model,
+        delay_spread=delay_spread,
+        carrier_frequency=carrier_frequency,
+        ut_array=ut_array,
+        bs_array=bs_array,
+        direction="uplink",
+        min_speed=speed,
+        max_speed=speed,
+    )
+
+    return channel_cdl, sm
+
+
+class Model(tf.keras.Model):
+    def __init__(self, perfect_csi):
+        super().__init__()
+
+        self._perfect_csi = perfect_csi
+
+        # Create PUSCHTransmitter
+        self._pusch_transmitter = PUSCHTransmitter(pusch_configs)
+
+        channel1, stream_management = choose_channel(cdl_model="A")
+        channel2, _ = choose_channel(cdl_model="C")
+
+        self._generate_channel1 = GenerateOFDMChannel(channel1, self._pusch_transmitter.resource_grid, normalize_channel=True)
+        self._generate_channel2 = GenerateOFDMChannel(channel2, self._pusch_transmitter.resource_grid, normalize_channel=True)
+
+        self._apply_channel = ApplyOFDMChannel(add_awgn=True)
+
+        detector = LinearDetector(equalizer="lmmse",
+                                  output="bit",
+                                  demapping_method="app",
+                                  resource_grid=self._pusch_transmitter.resource_grid,
+                                  stream_management=stream_management,
+                                  constellation_type="qam",
+                                  num_bits_per_symbol=pusch_config.tb.num_bits_per_symbol)
+
+        if self._perfect_csi:
+            self._pusch_receiver = PUSCHReceiver(self._pusch_transmitter,
+                                                 mimo_detector=detector,
+                                                 channel_estimator="perfect", )
+        else:
+            self._pusch_receiver = PUSCHReceiver(self._pusch_transmitter,
+                                                 mimo_detector=detector, )
+
+    @tf.function
+    def call(self, batch_size, ebno_db):
+        x, b = self._pusch_transmitter(batch_size)
+        no = ebnodb2no(ebno_db,
+                       self._pusch_transmitter._num_bits_per_symbol,
+                       self._pusch_transmitter._target_coderate,
+                       self._pusch_transmitter.resource_grid)
+        h1 = self._generate_channel1(batch_size)
+        # print("h1.shape:", h1.shape)  # (None, 1, 4, 1, 2, 14, 48)
+        h2 = self._generate_channel2(batch_size)
+        # h_freq:[batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+        h = tf.concat([h1, h2], axis=3)
+
+        y = self._apply_channel([x, h, no])
+
+        if self._perfect_csi:
+            b_hat = self._pusch_receiver([y, h, no])
+        else:
+            b_hat = self._pusch_receiver([y, no])
+
+        return b, b_hat
+
+BLER = {}
+model_baseline = Model(perfect_csi=False)
+_,bler = sim_ber(model_baseline, ebno_dbs, batch_size=128, num_target_block_errors=1000, max_mc_iter=1000)
+BLER['baseline'] = bler.numpy()
+
+model = Model(perfect_csi=True)
+_,bler = sim_ber(model, ebno_dbs, batch_size=128, num_target_block_errors=1000, max_mc_iter=1000)
+BLER['perfect'] = bler.numpy()
+
+plt.figure(figsize=(10,8))
+# Baseline
+plt.semilogy(ebno_dbs, BLER['baseline'], 'o-', c=f'C0', label=f'Baseline')
+# Perfect CSI
+plt.semilogy(ebno_dbs, BLER['perfect'], 'x-', c=f'C1', label=f'perfect')
+
+plt.xlabel(r"$E_b/N_0$ (dB)")
+plt.ylabel("BLER")
+plt.grid(which="both")
+plt.ylim((1e-4, 1.0))
+plt.legend()
+plt.tight_layout()
+plt.show()
